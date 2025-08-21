@@ -1,24 +1,10 @@
-// Website Status Checker (simplified per request)
-// Features: Periodic monitoring, HTTP header validation, and statistics only
-// Concurrency: std::thread + std::sync::mpsc (blocking; no async/Actix/Tokio)
-// HTTP client: ureq
-// Allowed deps only: ureq, serde (serde optional)
-// Build:
-//   cargo new sitewatch && cd sitewatch
-//   # Replace Cargo.toml with the one below, and put this file as src/main.rs
-// Run examples:
-//   cargo run -- --workers 50 --timeout-ms 5000 --retries 1 \
-//     https://example.org https://httpbin.org/status/503
-//   cargo run -- --period 15 https://example.org https://httpbin.org/delay/2
-
-use std::io; // used for ENTER-to-stop in periodic mode
+use std::io;
 use std::sync::{mpsc, Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use std::{env, fs};
 
-// --- Minimal stand-in for `chrono::{DateTime, Utc}` to satisfy the struct signature ---
 #[allow(non_camel_case_types)]
 mod chrono_shim {
     use std::marker::PhantomData;
@@ -47,14 +33,13 @@ mod chrono_shim {
 }
 use chrono_shim::{DateTime, Utc};
 
-// -------------------- Config & CLI --------------------
 #[derive(Debug, Clone)]
 struct Config {
     workers: usize,
     timeout: Duration,
     retries: u32,
-    period_secs: u64, // 0 means single run
-    header_checks: Vec<(String, String)>, // exact equals checks
+    period_secs: u64, 
+    header_checks: Vec<(String, String)>, 
     urls: Vec<String>,
 }
 
@@ -73,7 +58,7 @@ impl Default for Config {
 
 fn parse_args() -> Result<Config, String> {
     let mut cfg = Config::default();
-    let mut args = env::args().skip(1); // skip binary name
+    let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -123,7 +108,6 @@ fn parse_args() -> Result<Config, String> {
         return Err("no URLs provided. Pass them as args or with --file path".into());
     }
 
-    // Avoid spawning more workers than tasks (but keep at least 1)
     cfg.workers = cfg.workers.max(1).min(cfg.urls.len().max(1));
     Ok(cfg)
 }
@@ -136,7 +120,6 @@ fn parse_header_kv(s: &str) -> Result<(String, String), &'static str> {
     Ok((k.to_string(), v.to_string()))
 }
 
-// -------------------- Core Types --------------------
 #[derive(Debug, Clone)]
 struct WebsiteStatus {
     url: String,
@@ -167,7 +150,6 @@ impl Stats {
     }
 }
 
-// -------------------- Worker Pool --------------------
 #[derive(Debug)]
 enum Job {
     Check(String),
@@ -190,7 +172,6 @@ fn spawn_workers(
         let header_checks = header_checks.clone();
         let shutdown = shutdown.clone();
 
-        // Build one Agent per worker (blocking client)
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(timeout)
             .timeout_read(timeout)
@@ -209,7 +190,7 @@ fn spawn_workers(
                         let status = check_once_with_retries(&agent, &url, retries, &header_checks);
                         let _ = result_tx.send(status);
                     }
-                    None => break, // channel closed
+                    None => break, 
                 }
             }
         });
@@ -234,7 +215,6 @@ fn check_once_with_retries(
         match agent.get(url).call() {
             Ok(resp) => {
                 let code = resp.status();
-                // Header validation (exact matches)
                 for (k, expected) in header_checks.iter() {
                     match resp.header(k) {
                         Some(v) if v == expected => {},
@@ -265,7 +245,6 @@ fn check_once_with_retries(
                 };
             }
             Err(ureq::Error::Status(code, _resp)) => {
-                // HTTP status >= 400 (still a response)
                 return WebsiteStatus {
                     url: url.to_string(),
                     status: Ok(code as u16),
@@ -283,14 +262,12 @@ fn check_once_with_retries(
                         timestamp: DateTime::now(),
                     };
                 }
-                // small fixed backoff to avoid hammering
                 thread::sleep(Duration::from_millis(200));
             }
         }
     }
 }
 
-// -------------------- Runner --------------------
 fn run_once(cfg: &Config) -> Vec<WebsiteStatus> {
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (result_tx, result_rx) = mpsc::channel::<WebsiteStatus>();
@@ -308,15 +285,12 @@ fn run_once(cfg: &Config) -> Vec<WebsiteStatus> {
         shutdown.clone(),
     );
 
-    // Enqueue jobs
     for url in &cfg.urls {
         job_tx.send(Job::Check(url.clone())).expect("send job");
     }
 
-    // Close job channel so workers exit after queue drains
     drop(job_tx);
 
-    // Collect results
     let mut results = Vec::with_capacity(cfg.urls.len());
     for _ in 0..cfg.urls.len() {
         match result_rx.recv() {
@@ -325,7 +299,6 @@ fn run_once(cfg: &Config) -> Vec<WebsiteStatus> {
         }
     }
 
-    // Signal shutdown & join workers
     shutdown.store(true, Ordering::Relaxed);
     for h in workers { let _ = h.join(); }
 
@@ -363,17 +336,15 @@ fn run_periodic(cfg: Config) {
     assert!(cfg.period_secs > 0);
     let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Stdin watcher for graceful shutdown
     {
         let sd = shutdown.clone();
         thread::spawn(move || {
             let mut _dummy = String::new();
-            let _ = io::stdin().read_line(&mut _dummy); // press ENTER to stop
+            let _ = io::stdin().read_line(&mut _dummy); 
             sd.store(true, Ordering::Relaxed);
         });
     }
 
-    // Aggregated stats per URL
     use std::collections::HashMap;
     let mut agg: HashMap<String, Stats> = HashMap::new();
 
@@ -388,7 +359,6 @@ fn run_periodic(cfg: Config) {
             agg.entry(r.url.clone()).or_insert_with(Stats::new).record(r);
         }
 
-        // Sleep for the period, but wake early if shutdown
         let period = Duration::from_secs(cfg.period_secs);
         let start = Instant::now();
         while start.elapsed() < period {
@@ -397,7 +367,6 @@ fn run_periodic(cfg: Config) {
         }
     }
 
-    // Print aggregated stats
     println!("\nAggregate statistics:");
     println!("{:<7} | {:<7} | {:<7} | {}", "samples", "uptime%", "avg ms", "URL");
     println!("{}", "-".repeat(80));
@@ -437,7 +406,6 @@ fn main() {
     }
 }
 
-// -------------------- Tests --------------------
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,7 +425,6 @@ mod tests {
     fn handle_conn(stream: &mut TcpStream) {
         let mut buf = [0u8; 1024];
         let _ = stream.read(&mut buf);
-        // naive path sniffing
         let req = String::from_utf8_lossy(&buf);
         let path = req.split_whitespace().nth(1).unwrap_or("/");
         match path {
@@ -489,7 +456,6 @@ mod tests {
     fn test_run_once_ok_and_err() {
         let port = 34567;
         let _server = spawn_simple_http_server(port);
-        // give server a moment to bind
         thread::sleep(Duration::from_millis(50));
 
         let cfg = Config {
@@ -537,7 +503,7 @@ mod tests {
         thread::sleep(Duration::from_millis(50));
         let cfg = Config {
             workers: 2,
-            timeout: Duration::from_millis(50), // likely to timeout on /slow
+            timeout: Duration::from_millis(50),
             retries: 1,
             period_secs: 0,
             header_checks: vec![],
