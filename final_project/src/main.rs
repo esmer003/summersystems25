@@ -1,3 +1,4 @@
+// imports
 use std::io;
 use std::sync::{mpsc, Arc, Mutex};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 use std::{env, fs};
 
+//allows struct signature for time
 #[allow(non_camel_case_types)]
 mod chrono_shim {
     use std::marker::PhantomData;
@@ -12,12 +14,14 @@ mod chrono_shim {
     #[derive(Clone, Copy, Debug)]
     pub struct Utc;
 
+    //keep generic type
     #[derive(Clone, Copy, Debug)]
     pub struct DateTime<T> {
         pub(crate) inner: std::time::SystemTime,
         pub(crate) _marker: PhantomData<T>,
     }
 
+    //get current time
     impl<T> DateTime<T> {
         pub fn now() -> Self {
             Self { inner: std::time::SystemTime::now(), _marker: PhantomData }
@@ -33,6 +37,7 @@ mod chrono_shim {
 }
 use chrono_shim::{DateTime, Utc};
 
+//runtime from flags
 #[derive(Debug, Clone)]
 struct Config {
     workers: usize,
@@ -56,34 +61,41 @@ impl Default for Config {
     }
 }
 
+//command-line flags to configuration
 fn parse_args() -> Result<Config, String> {
     let mut cfg = Config::default();
     let mut args = env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
+            //set worker count
             "--workers" => {
                 let n = args.next().ok_or("--workers requires a value")?;
                 cfg.workers = n.parse().map_err(|_| "invalid --workers value")?;
             }
+            //set request timeout
             "--timeout-ms" => {
                 let n = args.next().ok_or("--timeout-ms requires a value")?;
                 let ms: u64 = n.parse().map_err(|_| "invalid --timeout-ms value")?;
                 cfg.timeout = Duration::from_millis(ms);
             }
+            //set transport retries
             "--retries" => {
                 let n = args.next().ok_or("--retries requires a value")?;
                 cfg.retries = n.parse().map_err(|_| "invalid --retries value")?;
             }
+            //allows for periodic mode
             "--period" => {
                 let n = args.next().ok_or("--period requires seconds")?;
                 cfg.period_secs = n.parse().map_err(|_| "invalid --period value")?;
             }
+            //header validation
             "--header" => {
                 let kv = args.next().ok_or("--header requires KEY=VALUE")?;
                 let (k, v) = parse_header_kv(&kv).map_err(|e| format!("--header: {}", e))?;
                 cfg.header_checks.push((k, v));
             }
+            //reads url from file
             "--file" => {
                 let path = args.next().ok_or("--file requires a path")?;
                 let content = fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {}", path, e))?;
@@ -112,6 +124,7 @@ fn parse_args() -> Result<Config, String> {
     Ok(cfg)
 }
 
+//header specification
 fn parse_header_kv(s: &str) -> Result<(String, String), &'static str> {
     let mut split = s.splitn(2, '=');
     let k = split.next().ok_or("missing key")?.trim();
@@ -120,6 +133,7 @@ fn parse_header_kv(s: &str) -> Result<(String, String), &'static str> {
     Ok((k.to_string(), v.to_string()))
 }
 
+//result types and statistic collection
 #[derive(Debug, Clone)]
 struct WebsiteStatus {
     url: String,
@@ -137,24 +151,29 @@ struct Stats {
 
 impl Stats {
     fn new() -> Self { Self { samples: 0, ok: 0, total_response: Duration::from_millis(0) } }
+    //update stats
     fn record(&mut self, s: &WebsiteStatus) {
         self.samples += 1;
         if let Ok(code) = s.status { if (200..=399).contains(&code) { self.ok += 1; } }
         self.total_response += s.response_time;
     }
+    //average response time
     fn avg_ms(&self) -> u128 {
         if self.samples == 0 { 0 } else { (self.total_response.as_millis()) / (self.samples as u128) }
     }
+    //percentage of good
     fn uptime_pct(&self) -> f64 {
         if self.samples == 0 { 0.0 } else { (self.ok as f64) * 100.0 / (self.samples as f64) }
     }
 }
 
+//job type
 #[derive(Debug)]
 enum Job {
     Check(String),
 }
 
+//wroker pool
 fn spawn_workers(
     n: usize,
     job_rx: Arc<Mutex<mpsc::Receiver<Job>>>,
@@ -172,12 +191,14 @@ fn spawn_workers(
         let header_checks = header_checks.clone();
         let shutdown = shutdown.clone();
 
+        //clocking http w/ timeouts
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(timeout)
             .timeout_read(timeout)
             .timeout_write(timeout)
             .build();
 
+        //recv job then run check then send result
         let handle = thread::spawn(move || {
             loop {
                 if shutdown.load(Ordering::Relaxed) { break; }
@@ -200,6 +221,7 @@ fn spawn_workers(
     handles
 }
 
+//url check w/ few retries
 fn check_once_with_retries(
     agent: &ureq::Agent,
     url: &str,
@@ -215,6 +237,7 @@ fn check_once_with_retries(
         match agent.get(url).call() {
             Ok(resp) => {
                 let code = resp.status();
+                //validate headers 
                 for (k, expected) in header_checks.iter() {
                     match resp.header(k) {
                         Some(v) if v == expected => {},
@@ -236,7 +259,7 @@ fn check_once_with_retries(
                         }
                     }
                 }
-
+                //return http status
                 return WebsiteStatus {
                     url: url.to_string(),
                     status: Ok(code as u16),
@@ -244,6 +267,7 @@ fn check_once_with_retries(
                     timestamp: ts,
                 };
             }
+            //server returned an http error
             Err(ureq::Error::Status(code, _resp)) => {
                 return WebsiteStatus {
                     url: url.to_string(),
@@ -252,6 +276,7 @@ fn check_once_with_retries(
                     timestamp: DateTime::now(),
                 };
             }
+            //transport error
             Err(e) => {
                 attempt += 1;
                 if attempt > retries {
@@ -268,11 +293,13 @@ fn check_once_with_retries(
     }
 }
 
+//run one full sweep 
 fn run_once(cfg: &Config) -> Vec<WebsiteStatus> {
     let (job_tx, job_rx) = mpsc::channel::<Job>();
     let (result_tx, result_rx) = mpsc::channel::<WebsiteStatus>();
     let shutdown = Arc::new(AtomicBool::new(false));
 
+    //share receiver
     let job_rx_arc = Arc::new(Mutex::new(job_rx));
 
     let workers = spawn_workers(
@@ -285,12 +312,14 @@ fn run_once(cfg: &Config) -> Vec<WebsiteStatus> {
         shutdown.clone(),
     );
 
+    //one job per url
     for url in &cfg.urls {
         job_tx.send(Job::Check(url.clone())).expect("send job");
     }
 
     drop(job_tx);
 
+    //collect results
     let mut results = Vec::with_capacity(cfg.urls.len());
     for _ in 0..cfg.urls.len() {
         match result_rx.recv() {
@@ -299,12 +328,14 @@ fn run_once(cfg: &Config) -> Vec<WebsiteStatus> {
         }
     }
 
+    //stop workers and join
     shutdown.store(true, Ordering::Relaxed);
     for h in workers { let _ = h.join(); }
 
     results
 }
 
+//result table
 fn print_results(results: &[WebsiteStatus]) {
     println!("\nResults ({} checks):", results.len());
     println!("{:<5} | {:<8} | {:<7} | {:<13} | {}", "#", "Status", "ms", "ts(ms)", "URL");
@@ -323,6 +354,7 @@ fn print_results(results: &[WebsiteStatus]) {
     }
 }
 
+//round statistics 
 fn print_round_stats(results: &[WebsiteStatus]) {
     let total = results.len() as f64;
     let successes = results.iter().filter(|r| matches!(r.status, Ok(c) if (200..=399).contains(&c))).count();
@@ -332,6 +364,7 @@ fn print_round_stats(results: &[WebsiteStatus]) {
     println!("\nRound stats: avg={}ms, uptime={:.2}% ({}/{})", avg_ms, uptime, successes, results.len());
 }
 
+//periodic loop until exit(enter)
 fn run_periodic(cfg: Config) {
     assert!(cfg.period_secs > 0);
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -345,6 +378,7 @@ fn run_periodic(cfg: Config) {
         });
     }
 
+    //collect stats while running
     use std::collections::HashMap;
     let mut agg: HashMap<String, Stats> = HashMap::new();
 
@@ -367,6 +401,7 @@ fn run_periodic(cfg: Config) {
         }
     }
 
+    //aggregate stats per url
     println!("\nAggregate statistics:");
     println!("{:<7} | {:<7} | {:<7} | {}", "samples", "uptime%", "avg ms", "URL");
     println!("{}", "-".repeat(80));
@@ -378,6 +413,7 @@ fn run_periodic(cfg: Config) {
     }
 }
 
+//entry point
 fn main() {
     match parse_args() {
         Ok(cfg) => {
@@ -389,6 +425,7 @@ fn main() {
                 run_periodic(cfg);
             }
         }
+        //basic help on error
         Err(e) => {
             eprintln!("error: {}", e);
             eprintln!("\nUsage: sitewatch [FLAGS] <url> [<url> ...]\n");
@@ -406,12 +443,14 @@ fn main() {
     }
 }
 
+//tests
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
     use std::io::{Read, Write};
 
+    //blocking http server for tests
     fn spawn_simple_http_server(port: u16) -> thread::JoinHandle<()> {
         thread::spawn(move || {
             let listener = TcpListener::bind(("127.0.0.1", port)).expect("bind test server");
@@ -422,6 +461,7 @@ mod tests {
         })
     }
 
+    //handle one conenction
     fn handle_conn(stream: &mut TcpStream) {
         let mut buf = [0u8; 1024];
         let _ = stream.read(&mut buf);
@@ -435,6 +475,7 @@ mod tests {
         }
     }
 
+    //compose an http response
     fn respond(stream: &mut TcpStream, code: u16, body: &str, ctype: &str) {
         let status_line = match code { 200 => "HTTP/1.1 200 OK", 404 => "HTTP/1.1 404 Not Found", 503 => "HTTP/1.1 503 Service Unavailable", _ => "HTTP/1.1 500 Internal Server Error" };
         let resp = format!(
